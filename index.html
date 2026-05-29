@@ -6,7 +6,7 @@
   <title>Air Canvas</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #0a0a0a; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; font-family: monospace; color: white; overflow: hidden; }
+    body { background: #0a0a0a; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; font-family: monospace; color: white; overflow: hidden; }
     #container { position: relative; width: 800px; height: 600px; border-radius: 16px; overflow: hidden; box-shadow: 0 0 40px rgba(0,255,180,0.2); }
     #webcam { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); object-fit: cover; }
     #canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
@@ -18,14 +18,14 @@
     #toolbar { display: flex; gap: 12px; margin-top: 16px; }
     .btn { background: #1a1a1a; border: 1px solid #333; color: white; padding: 10px 22px; border-radius: 10px; cursor: pointer; font-family: monospace; font-size: 14px; transition: all 0.15s; }
     .btn:hover { background: #2a2a2a; border-color: #555; }
-    .btn.active { border-color: #00dc64; color: #00dc64; }
     .color-btn { width: 34px; height: 34px; border-radius: 50%; border: 3px solid transparent; cursor: pointer; transition: transform 0.15s; }
     .color-btn:hover, .color-btn.active { transform: scale(1.25); border-color: white; }
     #colors { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
     #brush-row { display: flex; gap: 10px; align-items: center; margin-top: 10px; font-size: 13px; color: #888; }
     #brush-slider { accent-color: #00dc64; width: 100px; }
     #loading { position: fixed; inset: 0; background: #0a0a0a; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; z-index: 99; }
-    #loading p { color: #555; font-size: 14px; }
+    #loading p { color: #aaa; font-size: 14px; }
+    #loading small { color: #555; font-size: 12px; }
     .spinner { width: 40px; height: 40px; border: 3px solid #222; border-top-color: #00dc64; border-radius: 50%; animation: spin 0.8s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
   </style>
@@ -34,7 +34,8 @@
 
 <div id="loading">
   <div class="spinner"></div>
-  <p>Loading MediaPipe…</p>
+  <p id="load-msg">Loading MediaPipe…</p>
+  <small>First load may take 10–20 seconds</small>
 </div>
 
 <div id="container">
@@ -49,7 +50,7 @@
 <div id="toolbar">
   <button class="btn" onclick="clearCanvas()">🗑 Clear</button>
   <button class="btn" onclick="saveCanvas()">💾 Save</button>
-  <button class="btn" id="camBtn" onclick="toggleMirror()">🪞 Mirror</button>
+  <button class="btn" onclick="toggleMirror()">🪞 Mirror</button>
 </div>
 
 <div id="colors"></div>
@@ -58,11 +59,10 @@
   Brush size: <input id="brush-slider" type="range" min="4" max="40" value="10" oninput="brushSize=+this.value">
 </div>
 
-<!-- MediaPipe via CDN -->
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.js" crossorigin="anonymous"></script>
-
-<script>
-const { HandLandmarker, FilesetResolver } = window;
+<script type="module">
+// ── import MediaPipe from esm.sh (most reliable CDN) ──────────────────────
+import { FilesetResolver, HandLandmarker }
+  from "https://esm.sh/@mediapipe/tasks-vision@0.10.14";
 
 // ── state ──────────────────────────────────────────────────────────────────
 const COLORS = ['#00ffb4','#ff5000','#008cff','#ff00b4','#ffff00','#ffffff','#ff4444'];
@@ -75,14 +75,15 @@ let handLandmarker = null;
 let lastVideoTime  = -1;
 
 // ── DOM ────────────────────────────────────────────────────────────────────
-const video    = document.getElementById('webcam');
-const canvas   = document.getElementById('canvas');
-const hud      = document.getElementById('hud');
-const ctx      = canvas.getContext('2d');
-const hctx     = hud.getContext('2d');
+const video     = document.getElementById('webcam');
+const canvas    = document.getElementById('canvas');
+const hud       = document.getElementById('hud');
+const ctx       = canvas.getContext('2d');
+const hctx      = hud.getContext('2d');
 const modeBadge = document.getElementById('mode-badge');
 const swatch    = document.getElementById('swatch');
 const loading   = document.getElementById('loading');
+const loadMsg   = document.getElementById('load-msg');
 
 // ── colour buttons ─────────────────────────────────────────────────────────
 const colorsDiv = document.getElementById('colors');
@@ -94,51 +95,45 @@ COLORS.forEach((c, i) => {
     colorIdx = i;
     document.querySelectorAll('.color-btn').forEach((el,j) =>
       el.classList.toggle('active', j === i));
-    updateSwatch();
+    swatch.style.background = COLORS[colorIdx];
   };
   colorsDiv.appendChild(b);
 });
+swatch.style.background = COLORS[0];
 
-function updateSwatch() {
-  swatch.style.background = COLORS[colorIdx];
-}
-updateSwatch();
-
-// ── canvas resize ──────────────────────────────────────────────────────────
+// ── resize canvases to match video ────────────────────────────────────────
 function resizeCanvases() {
   const W = video.videoWidth  || 800;
   const H = video.videoHeight || 600;
   [canvas, hud].forEach(c => { c.width = W; c.height = H; });
 }
 
-// ── helpers ────────────────────────────────────────────────────────────────
+// ── finger count ──────────────────────────────────────────────────────────
 function fingersUp(lm) {
   const tips = [8, 12, 16, 20];
   const pips = [6, 10, 14, 18];
   return tips.reduce((n, tip, i) => n + (lm[tip].y < lm[pips[i]].y ? 1 : 0), 0);
 }
 
-function lmToPixel(lm, idx) {
-  // video is CSS-mirrored; landmark x is already from the real camera,
-  // so we flip x to match the mirrored display
+// ── landmark → pixel ──────────────────────────────────────────────────────
+function lmPx(lm, idx) {
   const x = mirrored ? (1 - lm[idx].x) * canvas.width : lm[idx].x * canvas.width;
   const y = lm[idx].y * canvas.height;
   return [x, y];
 }
 
-// smooth buffer
+// ── smoothing ─────────────────────────────────────────────────────────────
 const BUF = [];
-const BUF_SIZE = 5;
 function smooth(x, y) {
   BUF.push([x, y]);
-  if (BUF.length > BUF_SIZE) BUF.shift();
+  if (BUF.length > 5) BUF.shift();
   return [
-    BUF.reduce((s,p)=>s+p[0],0)/BUF.length,
-    BUF.reduce((s,p)=>s+p[1],0)/BUF.length,
+    BUF.reduce((s,p) => s + p[0], 0) / BUF.length,
+    BUF.reduce((s,p) => s + p[1], 0) / BUF.length,
   ];
 }
 
-// ── draw ───────────────────────────────────────────────────────────────────
+// ── draw on canvas ────────────────────────────────────────────────────────
 function drawStroke(x, y) {
   if (erasing) {
     ctx.save();
@@ -151,11 +146,11 @@ function drawStroke(x, y) {
     prevPt = null;
     return;
   }
+  ctx.globalCompositeOperation = 'source-over';
   ctx.strokeStyle = COLORS[colorIdx];
   ctx.lineWidth   = brushSize * 2;
   ctx.lineCap     = 'round';
   ctx.lineJoin    = 'round';
-  ctx.globalCompositeOperation = 'source-over';
   if (prevPt) {
     ctx.beginPath();
     ctx.moveTo(prevPt[0], prevPt[1]);
@@ -169,11 +164,9 @@ function drawStroke(x, y) {
   prevPt = [x, y];
 }
 
-// ── HUD overlay ────────────────────────────────────────────────────────────
+// ── HUD skeleton + cursor ─────────────────────────────────────────────────
 function drawHUD(lm, x, y) {
   hctx.clearRect(0, 0, hud.width, hud.height);
-
-  // skeleton connections
   const CONNS = [
     [0,1],[1,2],[2,3],[3,4],
     [0,5],[5,6],[6,7],[7,8],
@@ -181,18 +174,16 @@ function drawHUD(lm, x, y) {
     [9,13],[13,14],[14,15],[15,16],
     [13,17],[17,18],[18,19],[19,20],[0,17]
   ];
-  hctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  hctx.strokeStyle = 'rgba(255,255,255,0.2)';
   hctx.lineWidth   = 1.5;
   CONNS.forEach(([a,b]) => {
-    const [ax,ay] = lmToPixel(lm, a);
-    const [bx,by] = lmToPixel(lm, b);
+    const [ax,ay] = lmPx(lm, a);
+    const [bx,by] = lmPx(lm, b);
     hctx.beginPath();
-    hctx.moveTo(ax,ay);
-    hctx.lineTo(bx,by);
+    hctx.moveTo(ax, ay);
+    hctx.lineTo(bx, by);
     hctx.stroke();
   });
-
-  // fingertip cursor
   if (erasing) {
     hctx.strokeStyle = '#ff3c3c';
     hctx.lineWidth   = 2;
@@ -200,37 +191,34 @@ function drawHUD(lm, x, y) {
     hctx.arc(x, y, brushSize * 3, 0, Math.PI * 2);
     hctx.stroke();
   } else {
-    hctx.fillStyle = COLORS[colorIdx];
+    hctx.fillStyle   = COLORS[colorIdx];
     hctx.shadowColor = COLORS[colorIdx];
-    hctx.shadowBlur  = 12;
+    hctx.shadowBlur  = 14;
     hctx.beginPath();
     hctx.arc(x, y, brushSize + 4, 0, Math.PI * 2);
     hctx.fill();
-    hctx.shadowBlur = 0;
+    hctx.shadowBlur  = 0;
   }
 }
 
 // ── detection loop ─────────────────────────────────────────────────────────
 function detect() {
-  if (video.readyState < 2) { requestAnimationFrame(detect); return; }
-
-  const now = performance.now();
-  if (video.currentTime !== lastVideoTime) {
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
     lastVideoTime = video.currentTime;
-    const result  = handLandmarker.detectForVideo(video, now);
+    const result  = handLandmarker.detectForVideo(video, performance.now());
 
     hctx.clearRect(0, 0, hud.width, hud.height);
 
     if (result.landmarks && result.landmarks.length > 0) {
-      const lm    = result.landmarks[0];
-      const nUp   = fingersUp(lm);
-      erasing     = nUp >= 2;
+      const lm  = result.landmarks[0];
+      const nUp = fingersUp(lm);
+      erasing   = nUp >= 2;
 
       modeBadge.textContent = erasing ? 'ERASE' : 'DRAW';
-      modeBadge.className   = 'mode-badge' + (erasing ? ' erase' : '');
+      modeBadge.className   = erasing ? 'erase' : '';
 
-      const [rx, ry]  = lmToPixel(lm, 8);
-      const [sx, sy]  = smooth(rx, ry);
+      const [rx, ry] = lmPx(lm, 8);
+      const [sx, sy] = smooth(rx, ry);
 
       drawStroke(sx, sy);
       drawHUD(lm, sx, sy);
@@ -239,19 +227,17 @@ function detect() {
       BUF.length = 0;
     }
   }
-
   requestAnimationFrame(detect);
 }
 
-// ── toolbar actions ────────────────────────────────────────────────────────
-function clearCanvas() {
+// ── toolbar ────────────────────────────────────────────────────────────────
+window.clearCanvas = () => {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   prevPt = null;
-}
+};
 
-function saveCanvas() {
-  // merge webcam frame + drawing
-  const tmp  = document.createElement('canvas');
+window.saveCanvas = () => {
+  const tmp = document.createElement('canvas');
   tmp.width  = canvas.width;
   tmp.height = canvas.height;
   const tc   = tmp.getContext('2d');
@@ -264,48 +250,57 @@ function saveCanvas() {
   a.download = `air-canvas-${Date.now()}.png`;
   a.href     = tmp.toDataURL();
   a.click();
-}
+};
 
-function toggleMirror() {
+window.toggleMirror = () => {
   mirrored = !mirrored;
-  video.style.transform = mirrored ? 'scaleX(-1)' : 'scaleX(1)';
-}
+  video.style.transform = mirrored ? 'scaleX(-1)' : 'none';
+};
 
 // ── init ───────────────────────────────────────────────────────────────────
 async function init() {
-  // load MediaPipe
-  const filesetResolver = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-  );
-  handLandmarker = await HandLandmarker.createFromOptions(filesetResolver, {
-    baseOptions: {
-      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-      delegate: "GPU",
-    },
-    runningMode: "VIDEO",
-    numHands: 1,
-    minHandDetectionConfidence: 0.7,
-    minHandPresenceConfidence:  0.6,
-    minTrackingConfidence:      0.6,
-  });
+  try {
+    loadMsg.textContent = 'Loading WASM files…';
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
 
-  // camera
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { width: 1280, height: 720, facingMode: 'user' }
-  });
-  video.srcObject = stream;
-  await new Promise(r => video.onloadedmetadata = r);
-  await video.play();
-  resizeCanvases();
+    loadMsg.textContent = 'Loading hand model…';
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU",
+      },
+      runningMode: "VIDEO",
+      numHands: 1,
+      minHandDetectionConfidence: 0.7,
+      minHandPresenceConfidence:  0.6,
+      minTrackingConfidence:      0.6,
+    });
 
-  loading.style.display = 'none';
-  detect();
+    loadMsg.textContent = 'Starting camera…';
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720, facingMode: 'user' }
+    });
+    video.srcObject = stream;
+    await new Promise(r => video.onloadedmetadata = r);
+    await video.play();
+    resizeCanvases();
+
+    loading.style.display = 'none';
+    detect();
+
+  } catch (err) {
+    loading.innerHTML = `
+      <p style="color:#ff4444; font-size:16px">❌ Error</p>
+      <p style="color:#aaa; font-size:13px; max-width:400px; text-align:center">${err.message}</p>
+      <small style="color:#555">Check browser console for details (F12)</small>
+    `;
+    console.error(err);
+  }
 }
 
-init().catch(err => {
-  loading.innerHTML = `<p style="color:#ff4444">Error: ${err.message}</p>`;
-  console.error(err);
-});
+init();
 </script>
 </body>
 </html>
