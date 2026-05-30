@@ -34,7 +34,7 @@
 
 <div id="loading">
   <div class="spin"></div>
-  <p id="lmsg">Loading TensorFlow…</p>
+  <p id="lmsg">Starting…</p>
   <small>First load takes 10–20 seconds</small>
 </div>
 
@@ -52,241 +52,208 @@
   <button class="btn" id="saveBtn">💾 Save</button>
   <button class="btn" id="mirrorBtn">🪞 Mirror</button>
 </div>
-
 <div id="colors"></div>
+<div id="brow">Brush: <input id="bslider" type="range" min="3" max="35" value="10"></div>
 
-<div id="brow">
-  Brush: <input id="bslider" type="range" min="3" max="35" value="10">
-</div>
-
-<!-- TensorFlow.js + HandPose — loaded in order -->
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.20.0/dist/tf-core.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.20.0/dist/tf-backend-webgl.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/hand-pose-detection@2.0.1/dist/hand-pose-detection.min.js"></script>
+<!-- exact compatible versions -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.7/dist/handpose.min.js"></script>
 
 <script>
-// ── config ────────────────────────────────────────────────────────────────
 const COLORS = ['#00ffb4','#ff5000','#008cff','#ff00b4','#ffff00','#ffffff','#ff4444'];
-let colorIdx = 0, brushSize = 10, mirrored = true;
-let prevPt = null, erasing = false;
-let detector = null, lastT = -1;
+let colorIdx=0, brushSize=10, mirrored=true;
+let prevPt=null, erasing=false, model=null;
+const BUF=[];
 
-// ── DOM ───────────────────────────────────────────────────────────────────
-const video   = document.getElementById('webcam');
-const canvas  = document.getElementById('canvas');
-const hud     = document.getElementById('hud');
-const ctx     = canvas.getContext('2d');
-const hctx    = hud.getContext('2d');
-const badge   = document.getElementById('badge');
-const swatch  = document.getElementById('swatch');
-const lmsg    = document.getElementById('lmsg');
-const loading = document.getElementById('loading');
+const video  = document.getElementById('webcam');
+const canvas = document.getElementById('canvas');
+const hud    = document.getElementById('hud');
+const ctx    = canvas.getContext('2d');
+const hctx   = hud.getContext('2d');
+const badge  = document.getElementById('badge');
+const swatch = document.getElementById('swatch');
+const lmsg   = document.getElementById('lmsg');
+const loading= document.getElementById('loading');
 
-// ── colour palette ────────────────────────────────────────────────────────
+// colour buttons
 const cdiv = document.getElementById('colors');
-COLORS.forEach((c,i) => {
+COLORS.forEach((c,i)=>{
   const b = document.createElement('div');
-  b.className = 'cb' + (i===0?' on':'');
-  b.style.background = c;
-  b.onclick = () => {
-    colorIdx = i;
-    document.querySelectorAll('.cb').forEach((el,j) => el.classList.toggle('on', j===i));
-    swatch.style.background = c;
+  b.className='cb'+(i===0?' on':'');
+  b.style.background=c;
+  b.onclick=()=>{
+    colorIdx=i;
+    document.querySelectorAll('.cb').forEach((el,j)=>el.classList.toggle('on',j===i));
+    swatch.style.background=c;
   };
   cdiv.appendChild(b);
 });
-swatch.style.background = COLORS[0];
+swatch.style.background=COLORS[0];
+document.getElementById('bslider').oninput=e=>brushSize=+e.target.value;
 
-document.getElementById('bslider').oninput = e => brushSize = +e.target.value;
-
-// ── resize canvases ───────────────────────────────────────────────────────
-function resize() {
-  const W = video.videoWidth  || 640;
-  const H = video.videoHeight || 480;
-  [canvas, hud].forEach(c => { c.width = W; c.height = H; });
+function resize(){
+  const W=video.videoWidth||640, H=video.videoHeight||480;
+  [canvas,hud].forEach(c=>{c.width=W;c.height=H;});
 }
 
-// ── landmark helpers ──────────────────────────────────────────────────────
-// handpose gives keypoints as [{x,y,z,name}]
-// index order: 0=wrist,1-4=thumb,5-8=index,9-12=middle,13-16=ring,17-20=pinky
-function fingersUp(kp) {
-  // tip indices:  index=8, middle=12, ring=16, pinky=20
-  // pip indices:  index=6, middle=10, ring=14, pinky=18
-  const pairs = [[8,6],[12,10],[16,14],[20,18]];
-  return pairs.reduce((n,[tip,pip]) => n + (kp[tip].y < kp[pip].y ? 1 : 0), 0);
+// handpose gives 21 keypoints as [x,y,z]
+// landmarks: 0=wrist, 4=thumb tip, 8=index tip, 12=middle tip, 16=ring tip, 20=pinky tip
+// pip joints: 6=index pip, 10=middle pip, 14=ring pip, 18=pinky pip
+function fingersUp(lm){
+  const pairs=[[8,6],[12,10],[16,14],[20,18]];
+  return pairs.reduce((n,[tip,pip])=>n+(lm[tip][1]<lm[pip][1]?1:0),0);
 }
 
-function kpPx(kp, i) {
-  // kp coords are in video space (not normalised)
-  // mirror x because video is CSS-flipped
-  const x = mirrored ? canvas.width - kp[i].x : kp[i].x;
-  const y = kp[i].y;
-  // scale if canvas size differs from video size
-  const sx = x * canvas.width  / (video.videoWidth  || canvas.width);
-  const sy = y * canvas.height / (video.videoHeight || canvas.height);
-  return [sx, sy];
+function lmPx(lm, i){
+  const x = mirrored ? canvas.width - lm[i][0] : lm[i][0];
+  const y = lm[i][1];
+  return [x,y];
 }
 
-// smooth buffer
-const BUF = [];
-function smooth(x, y) {
+function smooth(x,y){
   BUF.push([x,y]);
-  if (BUF.length > 5) BUF.shift();
+  if(BUF.length>5) BUF.shift();
   return [
     BUF.reduce((s,p)=>s+p[0],0)/BUF.length,
     BUF.reduce((s,p)=>s+p[1],0)/BUF.length,
   ];
 }
 
-// ── stroke ────────────────────────────────────────────────────────────────
-function drawStroke(x, y) {
-  if (erasing) {
+function drawStroke(x,y){
+  if(erasing){
     ctx.save();
-    ctx.globalCompositeOperation = 'destination-out';
+    ctx.globalCompositeOperation='destination-out';
     ctx.beginPath();
-    ctx.arc(x, y, brushSize*3, 0, Math.PI*2);
-    ctx.fillStyle = 'rgba(0,0,0,1)';
+    ctx.arc(x,y,brushSize*3,0,Math.PI*2);
+    ctx.fillStyle='rgba(0,0,0,1)';
     ctx.fill();
     ctx.restore();
-    prevPt = null;
+    prevPt=null;
     return;
   }
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.strokeStyle = COLORS[colorIdx];
-  ctx.lineWidth   = brushSize * 2;
-  ctx.lineCap = ctx.lineJoin = 'round';
-  if (prevPt) {
+  ctx.globalCompositeOperation='source-over';
+  ctx.strokeStyle=COLORS[colorIdx];
+  ctx.lineWidth=brushSize*2;
+  ctx.lineCap=ctx.lineJoin='round';
+  if(prevPt){
     ctx.beginPath();
-    ctx.moveTo(prevPt[0], prevPt[1]);
-    ctx.lineTo(x, y);
+    ctx.moveTo(prevPt[0],prevPt[1]);
+    ctx.lineTo(x,y);
     ctx.stroke();
   }
   ctx.beginPath();
-  ctx.arc(x, y, brushSize, 0, Math.PI*2);
-  ctx.fillStyle = COLORS[colorIdx];
+  ctx.arc(x,y,brushSize,0,Math.PI*2);
+  ctx.fillStyle=COLORS[colorIdx];
   ctx.fill();
-  prevPt = [x, y];
+  prevPt=[x,y];
 }
 
-// ── HUD ───────────────────────────────────────────────────────────────────
-const CONNS = [
+const CONNS=[
   [0,1],[1,2],[2,3],[3,4],
   [0,5],[5,6],[6,7],[7,8],
   [5,9],[9,10],[10,11],[11,12],
   [9,13],[13,14],[14,15],[15,16],
   [13,17],[17,18],[18,19],[19,20],[0,17]
 ];
-function drawHUD(kp, x, y) {
+
+function drawHUD(lm,x,y){
   hctx.clearRect(0,0,hud.width,hud.height);
-  hctx.strokeStyle = 'rgba(255,255,255,0.2)';
-  hctx.lineWidth   = 1.5;
-  CONNS.forEach(([a,b]) => {
-    const [ax,ay] = kpPx(kp,a);
-    const [bx,by] = kpPx(kp,b);
-    hctx.beginPath(); hctx.moveTo(ax,ay); hctx.lineTo(bx,by); hctx.stroke();
+  hctx.strokeStyle='rgba(255,255,255,0.2)';
+  hctx.lineWidth=1.5;
+  CONNS.forEach(([a,b])=>{
+    const [ax,ay]=lmPx(lm,a);
+    const [bx,by]=lmPx(lm,b);
+    hctx.beginPath();hctx.moveTo(ax,ay);hctx.lineTo(bx,by);hctx.stroke();
   });
-  if (erasing) {
-    hctx.strokeStyle = '#ff3c3c';
-    hctx.lineWidth   = 2;
+  if(erasing){
+    hctx.strokeStyle='#ff3c3c';
+    hctx.lineWidth=2;
     hctx.beginPath();
     hctx.arc(x,y,brushSize*3,0,Math.PI*2);
     hctx.stroke();
   } else {
-    hctx.fillStyle   = COLORS[colorIdx];
-    hctx.shadowColor = COLORS[colorIdx];
-    hctx.shadowBlur  = 14;
+    hctx.fillStyle=COLORS[colorIdx];
+    hctx.shadowColor=COLORS[colorIdx];
+    hctx.shadowBlur=14;
     hctx.beginPath();
     hctx.arc(x,y,brushSize+4,0,Math.PI*2);
     hctx.fill();
-    hctx.shadowBlur = 0;
+    hctx.shadowBlur=0;
   }
 }
 
-// ── detect loop ───────────────────────────────────────────────────────────
-async function detect() {
-  if (video.readyState >= 2) {
-    const hands = await detector.estimateHands(video, {flipHorizontal: false});
+async function detect(){
+  if(video.readyState>=2){
+    const predictions = await model.estimateHands(video);
     hctx.clearRect(0,0,hud.width,hud.height);
 
-    if (hands.length > 0) {
-      const kp  = hands[0].keypoints;
-      const nUp = fingersUp(kp);
-      erasing   = nUp >= 2;
+    if(predictions.length>0){
+      const lm  = predictions[0].landmarks;
+      const nUp = fingersUp(lm);
+      erasing   = nUp>=2;
 
-      badge.textContent = erasing ? 'ERASE' : 'DRAW';
-      badge.className   = erasing ? 'erase' : '';
+      badge.textContent = erasing?'ERASE':'DRAW';
+      badge.className   = erasing?'erase':'';
 
-      const [rx,ry] = kpPx(kp, 8);   // index fingertip
+      const [rx,ry] = lmPx(lm,8);
       const [sx,sy] = smooth(rx,ry);
-
       drawStroke(sx,sy);
-      drawHUD(kp,sx,sy);
+      drawHUD(lm,sx,sy);
     } else {
-      prevPt = null;
-      BUF.length = 0;
+      prevPt=null;
+      BUF.length=0;
     }
   }
   requestAnimationFrame(detect);
 }
 
-// ── toolbar ───────────────────────────────────────────────────────────────
-document.getElementById('clearBtn').onclick = () => {
+document.getElementById('clearBtn').onclick=()=>{
   ctx.clearRect(0,0,canvas.width,canvas.height);
-  prevPt = null;
+  prevPt=null;
 };
 
-document.getElementById('saveBtn').onclick = () => {
-  const tmp = document.createElement('canvas');
-  tmp.width = canvas.width; tmp.height = canvas.height;
-  const tc  = tmp.getContext('2d');
+document.getElementById('saveBtn').onclick=()=>{
+  const tmp=document.createElement('canvas');
+  tmp.width=canvas.width; tmp.height=canvas.height;
+  const tc=tmp.getContext('2d');
   tc.save();
-  if (mirrored) { tc.translate(tmp.width,0); tc.scale(-1,1); }
+  if(mirrored){tc.translate(tmp.width,0);tc.scale(-1,1);}
   tc.drawImage(video,0,0,tmp.width,tmp.height);
   tc.restore();
   tc.drawImage(canvas,0,0);
-  const a = document.createElement('a');
-  a.download = `air-canvas-${Date.now()}.png`;
-  a.href = tmp.toDataURL(); a.click();
+  const a=document.createElement('a');
+  a.download=`air-canvas-${Date.now()}.png`;
+  a.href=tmp.toDataURL(); a.click();
 };
 
-document.getElementById('mirrorBtn').onclick = () => {
-  mirrored = !mirrored;
-  video.style.transform = mirrored ? 'scaleX(-1)' : 'none';
+document.getElementById('mirrorBtn').onclick=()=>{
+  mirrored=!mirrored;
+  video.style.transform=mirrored?'scaleX(-1)':'none';
 };
 
-// ── init ──────────────────────────────────────────────────────────────────
-async function init() {
-  try {
-    lmsg.textContent = 'Setting up TensorFlow WebGL…';
-    await tf.setBackend('webgl');
+async function init(){
+  try{
+    lmsg.textContent='Loading TensorFlow…';
     await tf.ready();
 
-    lmsg.textContent = 'Loading hand model…';
-    detector = await handPoseDetection.createDetector(
-      handPoseDetection.SupportedModels.MediaPipeHands,
-      {
-        runtime: 'tfjs',
-        modelType: 'lite',
-        maxHands: 1,
-      }
-    );
+    lmsg.textContent='Loading hand model…';
+    model = await handpose.load();
 
-    lmsg.textContent = 'Starting camera…';
+    lmsg.textContent='Starting camera…';
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width:640, height:480, facingMode:'user' }
+      video:{width:640,height:480,facingMode:'user'}
     });
-    video.srcObject = stream;
-    await new Promise(r => video.onloadedmetadata = r);
+    video.srcObject=stream;
+    await new Promise(r=>video.onloadedmetadata=r);
     await video.play();
     resize();
 
-    loading.style.display = 'none';
+    loading.style.display='none';
     detect();
-
-  } catch(err) {
-    loading.innerHTML = `
-      <p style="color:#ff4444;font-size:16px">❌ ${err.message}</p>
-      <small style="color:#555;max-width:360px;text-align:center">Open browser console (F12) for details</small>
+  } catch(err){
+    loading.innerHTML=`
+      <p style="color:#ff4444;font-size:15px">❌ ${err.message}</p>
+      <small style="color:#555;max-width:340px;text-align:center;margin-top:8px">Press F12 → Console for details</small>
     `;
     console.error(err);
   }
